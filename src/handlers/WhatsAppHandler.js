@@ -13,13 +13,13 @@ class WhatsAppHandler {
     this.fromNumber = process.env.TWILIO_WHATSAPP_NUMBER;
   }
   
-  // Main webhook handler for incoming WhatsApp messages
+  // Main webhook handler
   async handleIncomingMessage(req, res) {
     try {
       const { Body: message, From: from } = req.body;
       const phoneNumber = this.extractPhoneNumber(from);
       
-      console.log(`📨 Received message from ${phoneNumber}: ${message}`);
+      console.log(`📨 Message from ${phoneNumber}: ${message}`);
       
       // Get or create user
       const user = await UserService.getOrCreateUser(phoneNumber);
@@ -31,10 +31,10 @@ class WhatsAppHandler {
         return res.status(200).send('OK');
       }
       
-      // Process the message
-      const response = await this.processMessage(phoneNumber, message, user);
+      // Process with AI
+      const response = await this.processWithAI(phoneNumber, message, user);
       
-      // Send response back to user
+      // Send response
       await this.sendMessage(phoneNumber, response);
       
       // Update usage
@@ -43,52 +43,156 @@ class WhatsAppHandler {
       res.status(200).send('OK');
       
     } catch (error) {
-      console.error('❌ WhatsApp handler error:', error);
+      console.error('❌ Handler error:', error);
       
-      // Send error message to user
       const phoneNumber = this.extractPhoneNumber(req.body.From);
-      await this.sendMessage(phoneNumber, "❌ Sorry, I'm having technical difficulties. Please try again in a moment.");
+      await this.sendMessage(phoneNumber, "❌ Technical issue. Please try again.");
       
       res.status(500).send('Error');
     }
   }
   
-  // Process incoming message based on intent
-  async processMessage(phoneNumber, message, user) {
+  // Process message with AI and portfolio context
+  async processWithAI(phoneNumber, message, user) {
     try {
-      // Handle "done" specifically (authentication completion)
-      if (message.toLowerCase().trim() === 'done') {
+      // Handle special commands
+      const cleanMessage = message.toLowerCase().trim();
+      
+      // Authentication flow
+      if (cleanMessage === 'login' || cleanMessage === 'connect') {
+        return await this.handleAuthenticationRequest(phoneNumber, user);
+      }
+      
+      if (cleanMessage === 'done') {
         return await this.handleAuthenticationCompletion(phoneNumber, user);
       }
       
-      // Check if user needs authentication for portfolio queries
-      const requiresAuth = await ZerodhaService.requiresAuthentication(phoneNumber);
-      
-      // Use AI to detect intent and generate response
-      const aiResult = await AIService.processMessage(phoneNumber, message);
-      
-      // Handle specific intents that require special processing
-      switch (aiResult.intent) {
-        case 'authentication':
-          return await this.handleAuthenticationRequest(phoneNumber, user);
-          
-        case 'portfolio_query':
-          if (requiresAuth) {
-            return await this.handleAuthenticationRequest(phoneNumber, user);
-          }
-          return await this.handlePortfolioQuery(phoneNumber, message);
-          
-        case 'greeting':
-          return this.enhanceGreetingResponse(aiResult.response, user);
-          
-        default:
-          return aiResult.response;
+      // Quick commands
+      if (cleanMessage === 'portfolio' || cleanMessage === 'p') {
+        return await this.getQuickPortfolioSummary(phoneNumber);
       }
       
+      if (cleanMessage === 'pnl' || cleanMessage === 'profit') {
+        return await this.getQuickPnL(phoneNumber);
+      }
+      
+      if (cleanMessage === 'help') {
+        return this.getHelpMessage(user);
+      }
+      
+      // Check authentication for portfolio queries
+      const requiresAuth = await ZerodhaService.requiresAuthentication(phoneNumber);
+      if (requiresAuth && this.isPortfolioQuery(message)) {
+        return `🔐 Please connect your Zerodha account first.\n\nType "login" to get started.`;
+      }
+      
+      // Process with AI (which will fetch portfolio data if needed)
+      const aiResult = await AIService.processMessage(phoneNumber, message);
+      
+      // Handle special intents
+      if (aiResult.intent === 'authentication') {
+        return await this.handleAuthenticationRequest(phoneNumber, user);
+      }
+      
+      return aiResult.response;
+      
     } catch (error) {
-      console.error('Error processing message:', error);
-      return "❌ I'm having trouble understanding your request. Please try again or type 'help' for assistance.";
+      console.error('Processing error:', error);
+      return "❌ I'm having trouble understanding. Try:\n• 'portfolio' - View holdings\n• 'pnl' - Check profit/loss\n• 'help' - Get assistance";
     }
+  }
+  
+  // Check if message is portfolio-related
+  isPortfolioQuery(message) {
+    const portfolioKeywords = [
+      'portfolio', 'holdings', 'stocks', 'pnl', 'profit', 'loss',
+      'performance', 'investment', 'value', 'cash', 'margin'
+    ];
+    
+    const lowerMessage = message.toLowerCase();
+    return portfolioKeywords.some(keyword => lowerMessage.includes(keyword));
+  }
+  
+  // Quick portfolio summary
+  async getQuickPortfolioSummary(phoneNumber) {
+    const portfolioResult = await ZerodhaService.getPortfolioData(phoneNumber);
+    
+    if (!portfolioResult.success) {
+      if (portfolioResult.requiresAuth) {
+        return `🔐 Please login first. Type "login" to connect your Zerodha account.`;
+      }
+      return `❌ Unable to fetch portfolio. Please try again.`;
+    }
+    
+    const { metrics, holdings } = portfolioResult.data;
+    const pnlEmoji = metrics.holdings.totalPnL >= 0 ? '🟢' : '🔴';
+    
+    let response = `📊 *Your Portfolio*\n\n`;
+    response += `💼 Holdings: ${metrics.holdings.count} stocks\n`;
+    response += `💰 Total Value: ₹${metrics.holdings.totalValue.toLocaleString('en-IN')}\n`;
+    response += `${pnlEmoji} P&L: ₹${metrics.holdings.totalPnL.toLocaleString('en-IN')} (${metrics.holdings.totalPnLPercent.toFixed(2)}%)\n`;
+    response += `💳 Cash: ₹${metrics.overall.availableCash.toLocaleString('en-IN')}\n\n`;
+    
+    // Top 3 holdings
+    if (holdings && holdings.length > 0) {
+      const topHoldings = holdings
+        .sort((a, b) => (b.quantity * b.last_price) - (a.quantity * a.last_price))
+        .slice(0, 3);
+      
+      response += `*Top Holdings:*\n`;
+      topHoldings.forEach(h => {
+        const value = h.quantity * h.last_price;
+        const pnl = value - (h.quantity * h.average_price);
+        const emoji = pnl >= 0 ? '📈' : '📉';
+        response += `${emoji} ${h.tradingsymbol}: ₹${value.toLocaleString('en-IN')}\n`;
+      });
+    }
+    
+    response += `\n💡 Ask me about any specific stock or analysis!`;
+    
+    return response;
+  }
+  
+  // Quick P&L summary
+  async getQuickPnL(phoneNumber) {
+    const portfolioResult = await ZerodhaService.getPortfolioData(phoneNumber);
+    
+    if (!portfolioResult.success) {
+      if (portfolioResult.requiresAuth) {
+        return `🔐 Please login first. Type "login" to connect your Zerodha account.`;
+      }
+      return `❌ Unable to fetch P&L. Please try again.`;
+    }
+    
+    const { metrics } = portfolioResult.data;
+    const overallEmoji = metrics.holdings.totalPnL >= 0 ? '🟢' : '🔴';
+    
+    let response = `💰 *P&L Summary*\n\n`;
+    response += `${overallEmoji} *Total P&L:* ₹${metrics.holdings.totalPnL.toLocaleString('en-IN')}\n`;
+    response += `📊 *Returns:* ${metrics.holdings.totalPnLPercent.toFixed(2)}%\n`;
+    response += `📈 *Investment:* ₹${metrics.holdings.totalInvestment.toLocaleString('en-IN')}\n`;
+    response += `💼 *Current Value:* ₹${metrics.holdings.totalValue.toLocaleString('en-IN')}\n\n`;
+    
+    if (metrics.holdings.topGainers.length > 0) {
+      response += `*🚀 Top Gainers:*\n`;
+      metrics.holdings.topGainers.forEach(s => {
+        response += `• ${s.symbol}: +${s.pnlPercent.toFixed(2)}% (₹${s.pnl.toLocaleString('en-IN')})\n`;
+      });
+    }
+    
+    if (metrics.holdings.topLosers.length > 0) {
+      response += `\n*📉 Underperformers:*\n`;
+      metrics.holdings.topLosers.forEach(s => {
+        response += `• ${s.symbol}: ${s.pnlPercent.toFixed(2)}% (₹${s.pnl.toLocaleString('en-IN')})\n`;
+      });
+    }
+    
+    if (metrics.positions.dayPnL !== 0) {
+      const dayEmoji = metrics.positions.dayPnL >= 0 ? '📈' : '📉';
+      response += `\n${dayEmoji} *Today's P&L:* ₹${metrics.positions.dayPnL.toLocaleString('en-IN')}`;
+    }
+    
+    return response;
   }
   
   // Handle authentication request
@@ -96,37 +200,35 @@ class WhatsAppHandler {
     try {
       const { authURL, sessionId } = ZerodhaService.generateAuthURL(phoneNumber);
       
-      // Update user with session ID
       user.zerodhaAuth.sessionId = sessionId;
       await user.save();
       
       return `🔐 *Connect Your Zerodha Account*
 
-Please click the link below to log in to your Zerodha account:
+Click here to login: ${authURL}
 
-${authURL}
+After login:
+1. Complete 2FA on Zerodha
+2. You'll see a success page
+3. Come back here and type *"done"*
 
-🔹 This will open Zerodha's secure login page
-🔹 Enter your User ID, Password, and 2FA
-🔹 After successful login, come back here and type *"done"*
-
-🔒 *Your credentials are completely secure and never stored by TradeChat.*`;
+🔒 Your credentials are secure and never stored.`;
       
     } catch (error) {
-      console.error('Error handling authentication:', error);
-      return "❌ Sorry, I'm having trouble setting up authentication. Please try again.";
+      console.error('Auth error:', error);
+      return "❌ Authentication setup failed. Please try again.";
     }
   }
   
   // Handle authentication completion
   async handleAuthenticationCompletion(phoneNumber, user) {
     try {
-      // Find unused request token from recent authentications
+      // Check for recent request token
       global.tempTokens = global.tempTokens || {};
       
       let requestToken = null;
       for (const [token, data] of Object.entries(global.tempTokens)) {
-        if (!data.used && (Date.now() - data.timestamp) < 300000) { // 5 minutes
+        if (!data.used && (Date.now() - data.timestamp) < 300000) {
           requestToken = token;
           data.used = true;
           break;
@@ -134,110 +236,91 @@ ${authURL}
       }
       
       if (!requestToken) {
-        return "❌ No recent authentication found. Please type 'login' and complete the authentication process again.";
+        return "❌ No recent login found. Please type 'login' and try again.";
       }
       
-      // Complete authentication with Zerodha
       const authResult = await ZerodhaService.authenticateUser(requestToken, phoneNumber);
       
       if (authResult.success) {
-        return `✅ *Authentication Successful!*
-
-🎉 Your Zerodha account is now connected to TradeChat!
-
-You can now ask me:
-📊 "Show my portfolio"
-💰 "What's my P&L today?"
-📈 "How is [stock name] performing?"
-📋 "Portfolio summary"
-
-What would you like to know about your investments? 🚀`;
+        // Fetch initial portfolio data
+        const portfolio = await ZerodhaService.getPortfolioData(phoneNumber);
+        
+        let welcomeMsg = `✅ *Successfully Connected!*\n\n`;
+        
+        if (portfolio.success && portfolio.data.holdings) {
+          welcomeMsg += `🎉 I can now access your Zerodha portfolio!\n\n`;
+          welcomeMsg += `📊 You have ${portfolio.data.holdings.length} stocks in your portfolio.\n\n`;
+        }
+        
+        welcomeMsg += `Try these commands:\n`;
+        welcomeMsg += `• "portfolio" - View holdings\n`;
+        welcomeMsg += `• "pnl" - Check profit/loss\n`;
+        welcomeMsg += `• "How is TCS doing?" - Stock analysis\n`;
+        welcomeMsg += `• "Top gainers" - Best performers\n\n`;
+        welcomeMsg += `What would you like to know?`;
+        
+        return welcomeMsg;
       } else {
-        return `❌ Authentication failed: ${authResult.error}
-
-Please try typing 'login' again.`;
+        return `❌ Authentication failed: ${authResult.error}\n\nPlease type 'login' to try again.`;
       }
       
     } catch (error) {
-      console.error('Error completing authentication:', error);
-      return "❌ Error completing authentication. Please try the login process again.";
+      console.error('Auth completion error:', error);
+      return "❌ Error completing authentication. Please try again.";
     }
   }
   
-  // Handle portfolio queries with real data
-  async handlePortfolioQuery(phoneNumber, message) {
-  // Get fresh portfolio data
-  const portfolioResult = await ZerodhaService.getPortfolioData(phoneNumber);
-  
-  if (!portfolioResult.success) {
-    return "Cannot access your portfolio data right now.";
-  }
-  
-  // Format data for AI context
-  const portfolioContext = ZerodhaService.formatPortfolioForAI(portfolioResult.data);
-  
-  // Send question WITH portfolio context to AI
-  const enhancedMessage = `${message}
-
-Current Portfolio Data:
-${portfolioContext}`;
-  
-  const aiResponse = await AIService.processMessage(phoneNumber, enhancedMessage);
-  return aiResponse.response;
-}
-  // Enhance greeting response with user context
-  enhanceGreetingResponse(aiResponse, user) {
-    const isNewUser = user.usage.totalQueries === 0;
-    const isAuthenticated = user.zerodhaAuth.isAuthenticated;
+  // Get help message
+  getHelpMessage(user) {
+    const isAuthenticated = user?.zerodhaAuth?.isAuthenticated;
     
-    if (isNewUser) {
-      return `👋 Welcome to *TradeChat*!
-
-I'm your personal Zerodha portfolio assistant. I can help you:
-
-📊 Check your portfolio performance
-💰 View P&L and holdings  
-📈 Get stock insights and analysis
-🔍 Track your investments
-
-🚀 *Get Started:* Type 'login' to connect your Zerodha account!
-
-Type 'help' anytime for assistance.`;
-    }
+    let help = `🤖 *TradeChat Help*\n\n`;
     
     if (isAuthenticated) {
-      return `${aiResponse}
-
-📊 Your account is connected! Try asking:
-- "Show my portfolio"
-- "Today's P&L"
-- "Best performing stock"`;
+      help += `✅ Your account is connected!\n\n`;
+      help += `*Available Commands:*\n`;
+      help += `📊 "portfolio" - View all holdings\n`;
+      help += `💰 "pnl" - Check profit/loss\n`;
+      help += `📈 "[Stock] analysis" - e.g., "TCS analysis"\n`;
+      help += `🔝 "top gainers" - Best performers\n`;
+      help += `📉 "losers" - Underperformers\n`;
+      help += `💳 "cash" - Available funds\n\n`;
+      help += `*Natural Queries:*\n`;
+      help += `• "How's my portfolio doing?"\n`;
+      help += `• "Should I hold RELIANCE?"\n`;
+      help += `• "What's my biggest position?"\n`;
+      help += `• "Show today's performance"\n`;
+    } else {
+      help += `🔐 Connect your Zerodha account to start!\n\n`;
+      help += `Type *"login"* to connect your account.\n\n`;
+      help += `Once connected, I can:\n`;
+      help += `• Show your real-time portfolio\n`;
+      help += `• Track P&L and returns\n`;
+      help += `• Analyze individual stocks\n`;
+      help += `• Provide personalized insights\n`;
     }
     
-    return `${aiResponse}
-
-🔐 Type 'login' to connect your Zerodha account and get started!`;
+    return help;
   }
   
   // Get limit exceeded message
   getLimitExceededMessage(limitCheck) {
     return `🚫 *Daily Limit Reached*
 
-You've used all ${limitCheck.limit} queries for today (${limitCheck.tier} plan).
+You've used ${limitCheck.limit} queries today.
 
-💎 *Upgrade to Pro* for unlimited queries!
-🔄 *Free plan resets* tomorrow
+💎 Upgrade to Pro for unlimited access!
+🔄 Free tier resets tomorrow.
 
-Type 'upgrade' to learn about Pro features.`;
+Type 'upgrade' for Pro features.`;
   }
   
-  // Send WhatsApp message via Twilio
+  // Send WhatsApp message
   async sendMessage(phoneNumber, message) {
     try {
-      // Skip actual sending in development/test mode if Twilio not configured
       if (process.env.NODE_ENV === 'development' && 
           (!process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_ACCOUNT_SID === 'your_twilio_sid')) {
-        console.log(`📱 [TEST MODE] Would send to ${phoneNumber}: ${message.substring(0, 50)}...`);
+        console.log(`📱 [TEST] To ${phoneNumber}: ${message.substring(0, 100)}...`);
         return { sid: 'test_message_id' };
       }
       
@@ -247,22 +330,21 @@ Type 'upgrade' to learn about Pro features.`;
         to: `whatsapp:+${phoneNumber}`
       });
       
-      console.log(`✅ Message sent to ${phoneNumber}: ${message.substring(0, 50)}...`);
+      console.log(`✅ Sent to ${phoneNumber}`);
       return result;
       
     } catch (error) {
-      console.error('❌ Error sending WhatsApp message:', error);
+      console.error('❌ Send error:', error);
       throw error;
     }
   }
   
-  // Extract phone number from WhatsApp format
+  // Extract phone number
   extractPhoneNumber(whatsappNumber) {
-    // Convert "whatsapp:+919876543210" to "919876543210"
     return whatsappNumber.replace('whatsapp:+', '');
   }
   
-  // Webhook verification (required by Twilio)
+  // Webhook verification
   verifyWebhook(req, res) {
     const MessagingResponse = twilio.twiml.MessagingResponse;
     const twiml = new MessagingResponse();
